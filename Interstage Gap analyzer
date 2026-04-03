@@ -1,0 +1,226 @@
+# Excludes Sundays from gap calculation
+# Excludes official holidays (Diwali) from gap calculation
+# Excludes time outside working hours (before 9:30 AM and after 6:30 PM)
+# Excludes lunch break from 1:30 PM to 2:30 PM
+# Accounts for early closing on half-days (e.g., Oct 18 closes at 4:00 PM)
+
+import os
+import pandas as pd
+import tkinter as tk
+from tkinter import filedialog
+from datetime import datetime, timedelta, time
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Border, Side, Alignment, Font
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.worksheet.hyperlink import Hyperlink
+
+# Time configuration
+WORK_START, WORK_END = time(9, 30), time(18, 30)
+LUNCH_START, LUNCH_END = time(13, 30), time(14, 30)
+
+# Special dates
+HOLIDAYS = [
+    datetime(2025, 10, 2).date(),
+    datetime(2025, 10, 5).date(),
+    datetime(2025, 10, 20).date(),
+    datetime(2025, 10, 21).date(),
+    datetime(2025, 10, 22).date(),
+    datetime(2025, 10, 23).date()
+]
+HALF_DAYS = {datetime(2025, 10, 18).date(): time(16, 0)}
+
+# File selection
+root = tk.Tk()
+root.withdraw()
+file_path = filedialog.askopenfilename(
+    title="Select Excel File",
+    filetypes=[("Excel files", "*.xlsx *.xls")]
+)
+if not file_path:
+    print("❌ No file selected. Exiting.")
+    exit()
+
+# Load data
+df = pd.read_excel(file_path)
+
+# Preprocessing
+df["Opp No"] = df["Opp No"].astype(str).str.replace(",", "").astype(int)
+df["Stage Date"] = pd.to_datetime(df["Stage Date"], format="%d/%m/%Y", errors="coerce")
+df["Created Time"] = pd.to_datetime(df["Created Time"], format="%H:%M", errors="coerce").dt.time
+df = df[df["Created Time"].notna()]
+df["Full Timestamp"] = pd.to_datetime(df["Stage Date"].astype(str) + " " + df["Created Time"].astype(str), errors="coerce")
+df = df.sort_values(["Opp No", "Full Timestamp"])
+
+# Gap calculation
+def calc_minutes(start, end):
+    if pd.isna(start) or pd.isna(end):
+        return None
+    total, current = timedelta(), start
+    while current < end:
+        d = current.date()
+        if d.weekday() == 6 or d in HOLIDAYS:
+            current = datetime.combine(d + timedelta(days=1), WORK_START)
+            continue
+        we = HALF_DAYS.get(d, WORK_END)
+        ws, we = datetime.combine(d, WORK_START), datetime.combine(d, we)
+        ls, le = datetime.combine(d, LUNCH_START), datetime.combine(d, LUNCH_END)
+        if current < ws:
+            current = ws
+        if current >= we:
+            current = datetime.combine(d + timedelta(days=1), WORK_START)
+            continue
+        ce = min(we, end)
+        if current < ls and ce > ls:
+            total += min(ce, ls) - current + max(timedelta(), ce - le)
+        elif current >= le or ce <= ls:
+            total += ce - current
+        elif ls <= current < le:
+            current = le
+            continue
+        current = ce
+    return int(total.total_seconds() / 60)
+
+def extract_gap_parts(x):
+    if pd.notna(x) and x > 120:
+        days = x // 480
+        hours = (x % 480) // 60
+        minutes = x % 60
+        return pd.Series([days, f"{int(hours):02}:{int(minutes):02}"])
+    return pd.Series([None, None])
+
+# Calculate gaps
+df["Previous Time"] = df.groupby("Opp No")["Full Timestamp"].shift(1)
+df["Total Gap Minutes"] = df.apply(lambda r: calc_minutes(r["Previous Time"], r["Full Timestamp"]), axis=1)
+df[["Gap Days", "Gap Hours"]] = df["Total Gap Minutes"].apply(extract_gap_parts)
+
+# Filter latest stage date
+latest_stage_date = df["Stage Date"].max()
+df = df[df["Stage Date"] == latest_stage_date]
+filtered = df[df["Gap Hours"].notna()]
+
+# Cleanup columns
+drop_cols = [
+    '#', 'Enquiry Source', 'Category', 'Owner Name', 'Item Name 2', 'Item Name 3', 'Item Name 4', 'Item Name 5',
+    'Activity Remark', 'Content', 'Bill-to City', 'Authorised Person', 'Authorised Person 2', 'Remarks',
+    'Status 1', 'Status 2', 'Status 3', 'Actual Enquiry Date', 'Actual Enquiry Time', 'Gap Minutes'
+]
+filtered = filtered.drop(columns=drop_cols, errors='ignore')
+cols = list(filtered.columns)
+for col in ["Gap Hours", "Gap Days"]:
+    if col in cols and "Opp No" in cols:
+        cols.remove(col)
+cols.insert(cols.index("Opp No") + 1, "Gap Days")
+cols.insert(cols.index("Gap Days") + 1, "Gap Hours")
+filtered = filtered[cols]
+
+# Load vendor counts from external file
+vendor_df = pd.read_excel(
+    r"C:\\Users\\it4\\Desktop\\Report\\GAP REPORT\\Product Wise Vendor Details.xlsx",
+    sheet_name="Sheet2"
+)
+vendor_df.columns = vendor_df.columns.str.strip()
+if "Row Labels" not in vendor_df.columns or len(vendor_df.columns) < 2:
+    raise ValueError("Expected 'Row Labels' and at least one data column in Sheet2.")
+product_col = "Row Labels"
+count_col = vendor_df.columns[1]
+vendor_lookup = vendor_df.set_index(product_col)[count_col].to_dict()
+
+# Workbook setup
+wb = Workbook()
+wb.remove(wb.active)
+
+# Styles
+header_fill = PatternFill(start_color="367588", end_color="367588", fill_type="solid")
+header_font = Font(color="FFFFFF", bold=True)
+thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+left_align = Alignment(horizontal='left')
+rosy_fill = PatternFill(start_color="BC8F8F", end_color="BC8F8F", fill_type="solid")
+
+sheet_links = {}
+
+# Stage sheets
+for stage, group in filtered.groupby("Stage"):
+    title = str(stage)[:31]
+    ws = wb.create_sheet(title=title)
+    sheet_links[stage] = title
+
+    # Back link
+    back_cell = ws.cell(row=1, column=1, value="← Back to Summary")
+    back_cell.hyperlink = Hyperlink(ref=back_cell.coordinate, location="'Gap Report'!A1", display="← Back to Summary")
+    back_cell.font = Font(color="0000FF", underline="single")
+
+    for r, row in enumerate(dataframe_to_rows(group, index=False, header=True), 2):
+        for c, val in enumerate(row, 1):
+            cell = ws.cell(row=r, column=c, value=val)
+            cell.border = thin_border
+            cell.alignment = left_align
+            if r == 2:
+                cell.fill = header_fill
+                cell.font = header_font
+
+    # Insert "Count of Vendors" column after "Item Name 1"
+    item_col = None
+    for col in range(1, ws.max_column + 1):
+        if ws.cell(row=2, column=col).value == "Item Name 1":
+            item_col = col
+            break
+
+    if item_col:
+        vendor_col = item_col + 1
+        ws.insert_cols(vendor_col)
+        ws.cell(row=2, column=vendor_col, value="Count of Vendors").fill = header_fill
+        ws.cell(row=2, column=vendor_col).font = header_font
+        ws.cell(row=2, column=vendor_col).border = thin_border
+        ws.cell(row=2, column=vendor_col).alignment = left_align
+
+        for row in range(3, ws.max_row + 1):
+            item_name = ws.cell(row=row, column=item_col).value
+            count = vendor_lookup.get(item_name, 0)
+            cell = ws.cell(row=row, column=vendor_col, value=count)
+            cell.border = thin_border
+            cell.alignment = left_align
+
+    # Highlight Gap Days > 1
+    for col in range(1, ws.max_column + 1):
+        if ws.cell(row=2, column=col).value == "Gap Days":
+            for row in range(3, ws.max_row + 1):
+                cell = ws.cell(row=row, column=col)
+                if isinstance(cell.value, (int, float)) and cell.value > 1:
+                    cell.fill = rosy_fill
+            break
+
+# Summary sheet
+summary = pd.DataFrame({"Stage": filtered["Stage"].unique()})
+
+ws_summary = wb.create_sheet(title="Gap Report")
+
+for r, row in enumerate(dataframe_to_rows(summary, index=False, header=True), 1):
+    for c, val in enumerate(row, 1):
+        cell = ws_summary.cell(row=r, column=c, value=val)
+        cell.border = thin_border
+        cell.alignment = left_align
+        if r == 1:
+            cell.fill = header_fill
+            cell.font = header_font
+        elif c == 1 and val in sheet_links:
+            cell.hyperlink = Hyperlink(ref=cell.coordinate, location=f"'{sheet_links[val]}'!A1", display=val)
+            cell.font = Font(color="0000FF", underline="single")
+
+# Highlight top 3 stages
+# top_counts = summary["Count"].nlargest(3).tolist()
+# for row in ws_summary.iter_rows(min_row=2, max_row=ws_summary.max_row, min_col=2, max_col=2):
+    # for cell in row:
+    #     if cell.value in top_counts:
+    #         cell.fill = rosy_fill
+    #         ws_summary.cell(row=cell.row, column=1).fill = rosy_fill
+
+# Auto-fit columns
+for col in ws_summary.columns:
+    max_len = max(len(str(cell.value)) for cell in col if cell.value)
+    ws_summary.column_dimensions[col[0].column_letter].width = max_len + 2
+
+# Save and open
+output_path = file_path.replace(".xlsx", "_OP.xlsx")
+wb.save(output_path)
+os.startfile(output_path)
+print(f"✅ Done! Saved and opened: {output_path}")
